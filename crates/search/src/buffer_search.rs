@@ -61,28 +61,22 @@ pub enum Event {
     Dismissed,
 }
 
-/// The find string the macOS find pasteboard was last known to hold.
-///
-/// The pasteboard is system-wide, but every pane's toolbar owns its own [`BufferSearchBar`]
-/// (the terminal panel builds a separate one of its own) and macOS offers no notification
-/// when the pasteboard changes. Mirroring it into a global lets every search bar observe one
-/// find string instead of each polling on its own.
+/// Each pane and the terminal panel has its own search bar. A shared cache lets them
+/// observe the same find string without polling the pasteboard independently.
 #[cfg(target_os = "macos")]
 #[derive(PartialEq, Eq)]
 struct FindPasteboardQuery {
     text: Option<String>,
-    /// `None` for text written by another application, which carries none of Zed's search
-    /// options. Each search bar then keeps the options it is already using.
+    /// Other applications omit Zed's search options, so each bar keeps its current
+    /// options when this is `None`.
     options: Option<SearchOptions>,
 }
 
 #[cfg(target_os = "macos")]
 impl Global for FindPasteboardQuery {}
 
-/// Re-read the pasteboard, notifying observers only if it actually changed.
-///
-/// The comparison is load-bearing: `set_global` always notifies, and notifying re-runs a
-/// search in every deployed search bar.
+/// `set_global` always notifies observers, so compare the cached query to avoid rerunning
+/// searches in every deployed bar when the pasteboard is unchanged.
 #[cfg(target_os = "macos")]
 fn refresh_find_pasteboard(cx: &mut App) {
     let Some(item) = cx.read_from_find_pasteboard() else {
@@ -806,8 +800,7 @@ impl BufferSearchBar {
 
         #[cfg(target_os = "macos")]
         let find_pasteboard_subscriptions = [
-            // Nothing notifies us when another application writes the find pasteboard, so
-            // re-read it whenever this window is brought forward.
+            // macOS has no find pasteboard change notification, so refresh on activation.
             cx.observe_window_activation(window, |_, window, cx| {
                 if window.is_window_active() {
                     refresh_find_pasteboard(cx);
@@ -1084,8 +1077,7 @@ impl BufferSearchBar {
                 } else {
                     suggestion
                 };
-                // Zed's own seeding, not a find the user asked for, so it must not replace the
-                // system-wide find string.
+                // Opening the search bar must not overwrite the system find string.
                 self.search_internal(&suggestion, Some(self.default_options), true, window, cx)
             });
 
@@ -1177,11 +1169,8 @@ impl BufferSearchBar {
         cx.notify();
     }
 
-    /// Run a search the user asked for, publishing the query as the system-wide find string.
-    ///
-    /// Searches Zed starts on its own — seeding the query when the search bar is deployed, or
-    /// adopting a query that came from the find pasteboard in the first place — must use
-    /// [`Self::search_internal`] instead, so that they leave the find pasteboard alone.
+    /// Use [`Self::search_internal`] when seeding or importing a query to avoid
+    /// overwriting the macOS find pasteboard.
     pub fn search(
         &mut self,
         query: &str,
@@ -1206,7 +1195,7 @@ impl BufferSearchBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<()> {
-        // Starting any search supersedes a query stashed from the find pasteboard.
+        // A new search supersedes the pending query; refreshing matches does not.
         #[cfg(target_os = "macos")]
         self.pending_external_query.take();
 
@@ -1227,11 +1216,8 @@ impl BufferSearchBar {
         self.update_matches(!updated, add_to_history, window, cx)
     }
 
-    /// Write the query to the find pasteboard without telling the other search bars.
-    ///
-    /// Used while the user types in the find field: mirroring every keystroke would re-run a
-    /// search in every other deployed search bar in the app, and no Mac app does that either.
-    /// The global catches up at the next [`refresh_find_pasteboard`].
+    /// Defer updating the global until [`refresh_find_pasteboard`] so typing does not
+    /// rerun searches in every other deployed bar on each keystroke.
     #[cfg(target_os = "macos")]
     fn write_find_pasteboard(&mut self, cx: &mut App) {
         cx.write_to_find_pasteboard(gpui::ClipboardItem::new_string_with_metadata(
@@ -1240,7 +1226,6 @@ impl BufferSearchBar {
         ));
     }
 
-    /// Write the query to the find pasteboard and bring the other search bars in line with it.
     #[cfg(target_os = "macos")]
     fn publish_find_pasteboard(&mut self, cx: &mut App) {
         self.write_find_pasteboard(cx);
@@ -1267,7 +1252,7 @@ impl BufferSearchBar {
             return;
         }
         if self.query_editor_focused || self.replacement_editor_focused {
-            // Don't pull the find field out from under someone typing in it.
+            // Preserve the query while the user is editing it.
             return;
         }
 
@@ -1275,9 +1260,8 @@ impl BufferSearchBar {
             self.pending_external_query = Some((text, options));
             return;
         }
-        // Deliberately neither awaits the search nor activates a match: this runs for search
-        // bars the user isn't interacting with, and activating a match scrolls the editor or
-        // terminal it belongs to.
+        // Do not activate a match: syncing a background search bar must not scroll its
+        // editor or terminal.
         drop(self.search_internal(&text, Some(options), true, window, cx));
     }
 
@@ -1287,7 +1271,6 @@ impl BufferSearchBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Underscored because it is only read on macOS, the one platform with a find pasteboard.
         let _deployed = self.deploy(
             &Deploy {
                 focus: false,
@@ -1299,9 +1282,8 @@ impl BufferSearchBar {
             cx,
         );
 
-        // `deploy` seeds the query synchronously, so it already holds the selection. Publish
-        // unconditionally rather than only when the query changed, so that repeating this
-        // after another application took over the find pasteboard reclaims it.
+        // `deploy` seeds the query synchronously. Republish even unchanged selections,
+        // since another application may have overwritten the find pasteboard.
         #[cfg(target_os = "macos")]
         if _deployed && !self.query(cx).is_empty() {
             self.publish_find_pasteboard(cx);
@@ -3580,9 +3562,6 @@ mod tests {
         );
     }
 
-    /// Builds a window holding a workspace whose active pane has a `BufferSearchBar` in its
-    /// toolbar, over an editor containing `dad cat mom dog dog cat dad mom`, one word per line.
-    /// The real macOS keymap is bound, so `cmd-e` / `cmd-f` / `cmd-g` can be simulated.
     #[cfg(target_os = "macos")]
     async fn init_find_pasteboard_test(
         cx: &mut TestAppContext,
@@ -3651,8 +3630,7 @@ mod tests {
 
         let cx = VisualTestContext::from_window(*window, cx).into_mut();
 
-        // Start from a known find string, so that a test can tell whether Zed wrote to the
-        // find pasteboard or left it alone.
+        // A distinct baseline makes unintended pasteboard writes observable.
         write_find_pasteboard_externally(FIND_PASTEBOARD_BASELINE, cx);
         cx.run_until_parked();
 
@@ -3662,8 +3640,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     const FIND_PASTEBOARD_BASELINE: &str = "baseline";
 
-    /// Deploys the search bar without focusing its query editor, the way a search bar in some
-    /// other pane looks while the user works in this one.
     #[cfg(target_os = "macos")]
     fn deploy_unfocused(search_bar: &Entity<BufferSearchBar>, cx: &mut VisualTestContext) {
         search_bar.update_in(cx, |search_bar, window, cx| {
@@ -3688,13 +3664,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn write_find_pasteboard_externally(text: &str, cx: &mut VisualTestContext) {
-        // No metadata, the way any other application writes the find pasteboard.
+        // Other applications do not include Zed's search options metadata.
         let item = gpui::ClipboardItem::new_string(text.to_string());
         cx.update(|_, cx| cx.write_to_find_pasteboard(item));
     }
 
-    /// Simulates switching to another application, having it run "Use Selection for Find", and
-    /// switching back to Zed.
     #[cfg(target_os = "macos")]
     fn use_selection_for_find_in_another_app(text: &str, cx: &mut VisualTestContext) {
         cx.deactivate_window();
@@ -3714,8 +3688,6 @@ mod tests {
         });
     }
 
-    /// `cmd-f` seeds the query from the buffer but must leave the system find string alone —
-    /// other Mac apps don't publish the selection just because you opened their find bar.
     #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn test_deploy_does_not_clobber_find_pasteboard(cx: &mut TestAppContext) {
@@ -3725,19 +3697,15 @@ mod tests {
         cx.simulate_keystrokes("cmd-f");
         cx.run_until_parked();
 
-        // Seeding still works...
         search_bar.read_with(cx, |search_bar, cx| {
             assert_eq!(search_bar.query(cx), "dog");
         });
-        // ...but it did not take over the find pasteboard.
         assert_eq!(
             find_pasteboard_text(cx).as_deref(),
             Some(FIND_PASTEBOARD_BASELINE)
         );
     }
 
-    /// `cmd-e` publishes even when the query text is unchanged, so that reclaiming the find
-    /// pasteboard after another application wrote to it always works.
     #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn test_use_selection_for_find_republishes_unchanged_query(cx: &mut TestAppContext) {
@@ -3750,7 +3718,6 @@ mod tests {
 
         write_find_pasteboard_externally("stolen", cx);
 
-        // Same selection, so the query does not change - but the find pasteboard must.
         cx.simulate_keystrokes("cmd-e");
         cx.run_until_parked();
         search_bar.read_with(cx, |search_bar, cx| {
@@ -3759,14 +3726,11 @@ mod tests {
         assert_eq!(find_pasteboard_text(cx).as_deref(), Some("dog"));
     }
 
-    /// Typing in the find field is a find the user asked for, so it still publishes.
     #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn test_typing_query_publishes_to_find_pasteboard(cx: &mut TestAppContext) {
         let (cx, _editor, search_bar) = init_find_pasteboard_test(cx).await;
 
-        // `Deploy::find()` focuses the query editor and selects whatever is in it, so the
-        // typed keystrokes replace it.
         search_bar.update_in(cx, |search_bar, window, cx| {
             search_bar.deploy(&Deploy::find(), None, window, cx);
         });
@@ -3778,8 +3742,6 @@ mod tests {
         assert_eq!(find_pasteboard_text(cx).as_deref(), Some("mom"));
     }
 
-    /// A find string set by another application reaches a search bar that is already deployed,
-    /// even though its item never gained focus.
     #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn test_external_find_pasteboard_reaches_deployed_search_bar(cx: &mut TestAppContext) {
@@ -3798,9 +3760,6 @@ mod tests {
         });
     }
 
-    /// `cmd-e` in one pane updates the search bar of another - the terminal panel builds its
-    /// own `BufferSearchBar`, and the find string is shared. The second bar must not scroll or
-    /// move the selections of the item it is searching.
     #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn test_use_selection_for_find_updates_other_deployed_search_bar(
@@ -3845,8 +3804,7 @@ mod tests {
         );
     }
 
-    /// A dismissed search bar stashes the external find string until the next search. Terminals
-    /// invalidate their matches on every byte of output, which used to throw the stash away.
+    // Terminal output invalidates matches and must not discard a pending external query.
     #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn test_external_query_survives_matches_invalidated(cx: &mut TestAppContext) {
@@ -3880,9 +3838,8 @@ mod tests {
             );
         });
 
-        // cmd-g applies it, which is what makes `cmd-e` in another app work. Re-focus the
-        // editor first: the test platform doesn't restore focus on reactivation the way macOS
-        // does, and without it the keystroke has no `Pane` context to dispatch through.
+        // The test platform does not restore focus on activation. Refocus the editor so
+        // cmd-g has a Pane context to dispatch through.
         cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
         cx.run_until_parked();
         cx.simulate_keystrokes("cmd-g");
