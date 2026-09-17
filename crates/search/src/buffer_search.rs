@@ -19,6 +19,8 @@ use editor::{
     scroll::Autoscroll,
 };
 use futures::channel::oneshot;
+#[cfg(target_os = "macos")]
+use gpui::Global;
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, Focusable, InteractiveElement as _,
     IntoElement, KeyContext, ParentElement as _, Render, ScrollHandle, Styled, Subscription, Task,
@@ -59,6 +61,40 @@ pub enum Event {
     Dismissed,
 }
 
+/// Each pane and the terminal panel has its own search bar. A shared cache lets them
+/// observe the same find string without polling the pasteboard independently.
+#[cfg(target_os = "macos")]
+#[derive(PartialEq, Eq)]
+struct FindPasteboardQuery {
+    text: Option<String>,
+    /// Other applications omit Zed's search options, so each bar keeps its current
+    /// options when this is `None`.
+    options: Option<SearchOptions>,
+}
+
+#[cfg(target_os = "macos")]
+impl Global for FindPasteboardQuery {}
+
+/// `set_global` always notifies observers, so compare the cached query to avoid rerunning
+/// searches in every deployed bar when the pasteboard is unchanged.
+#[cfg(target_os = "macos")]
+fn refresh_find_pasteboard(cx: &mut App) {
+    let Some(item) = cx.read_from_find_pasteboard() else {
+        return;
+    };
+    let query = FindPasteboardQuery {
+        text: item.text(),
+        options: item
+            .metadata()
+            .and_then(|metadata| metadata.parse().ok())
+            .and_then(SearchOptions::from_bits),
+    };
+    if query.text.is_none() || cx.try_global::<FindPasteboardQuery>() == Some(&query) {
+        return;
+    }
+    cx.set_global(query);
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| BufferSearchBar::register(workspace))
         .detach();
@@ -77,6 +113,8 @@ pub struct BufferSearchBar {
     active_searchable_item_subscriptions: Option<Subscription>,
     #[cfg(target_os = "macos")]
     pending_external_query: Option<(String, SearchOptions)>,
+    #[cfg(target_os = "macos")]
+    _find_pasteboard_subscriptions: [Subscription; 2],
     active_search: Option<Arc<SearchQuery>>,
     searchable_items_with_matches:
         HashMap<Box<dyn WeakSearchableItemHandle>, (AnyVec<dyn Send>, SearchToken)>,
@@ -574,30 +612,7 @@ impl ToolbarItemView for BufferSearchBar {
                             return;
                         }
 
-                        cx.defer_in(window, |this, window, cx| {
-                            let Some(item) = cx.read_from_find_pasteboard() else {
-                                return;
-                            };
-                            let Some(text) = item.text() else {
-                                return;
-                            };
-
-                            if this.query(cx) == text {
-                                return;
-                            }
-
-                            let search_options = item
-                                .metadata()
-                                .and_then(|m| m.parse().ok())
-                                .and_then(SearchOptions::from_bits)
-                                .unwrap_or(this.search_options);
-
-                            if this.dismissed {
-                                this.pending_external_query = Some((text, search_options));
-                            } else {
-                                drop(this.search(&text, Some(search_options), true, window, cx));
-                            }
-                        });
+                        cx.defer_in(window, |_, _, cx| refresh_find_pasteboard(cx));
                     }),
                 ]);
             }
@@ -783,6 +798,17 @@ impl BufferSearchBar {
             .detach_and_log_err(cx);
         }
 
+        #[cfg(target_os = "macos")]
+        let find_pasteboard_subscriptions = [
+            // macOS has no find pasteboard change notification, so refresh on activation.
+            cx.observe_window_activation(window, |_, window, cx| {
+                if window.is_window_active() {
+                    refresh_find_pasteboard(cx);
+                }
+            }),
+            cx.observe_global_in::<FindPasteboardQuery>(window, Self::on_find_pasteboard_changed),
+        ];
+
         Self {
             query_editor,
             query_editor_focused: false,
@@ -792,6 +818,8 @@ impl BufferSearchBar {
             active_searchable_item_subscriptions: None,
             #[cfg(target_os = "macos")]
             pending_external_query: None,
+            #[cfg(target_os = "macos")]
+            _find_pasteboard_subscriptions: find_pasteboard_subscriptions,
             active_match_index: None,
             searchable_items_with_matches: Default::default(),
             default_options: search_options,
@@ -1049,14 +1077,15 @@ impl BufferSearchBar {
                 } else {
                     suggestion
                 };
-                self.search(&suggestion, Some(self.default_options), true, window, cx)
+                // Opening the search bar must not overwrite the system find string.
+                self.search_internal(&suggestion, Some(self.default_options), true, window, cx)
             });
 
         #[cfg(target_os = "macos")]
         let search = search.or_else(|| {
-            self.pending_external_query
-                .take()
-                .map(|(query, options)| self.search(&query, Some(options), true, window, cx))
+            self.pending_external_query.take().map(|(query, options)| {
+                self.search_internal(&query, Some(options), true, window, cx)
+            })
         });
 
         if let Some(search) = search {
@@ -1140,6 +1169,8 @@ impl BufferSearchBar {
         cx.notify();
     }
 
+    /// Use [`Self::search_internal`] when seeding or importing a query to avoid
+    /// overwriting the macOS find pasteboard.
     pub fn search(
         &mut self,
         query: &str,
@@ -1148,6 +1179,26 @@ impl BufferSearchBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<()> {
+        let done_rx = self.search_internal(query, options, add_to_history, window, cx);
+        #[cfg(target_os = "macos")]
+        if !self.query(cx).is_empty() {
+            self.publish_find_pasteboard(cx);
+        }
+        done_rx
+    }
+
+    fn search_internal(
+        &mut self,
+        query: &str,
+        options: Option<SearchOptions>,
+        add_to_history: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<()> {
+        // A new search supersedes the pending query; refreshing matches does not.
+        #[cfg(target_os = "macos")]
+        self.pending_external_query.take();
+
         let options = options.unwrap_or(self.default_options);
         let updated = query != self.query(cx) || self.search_options != options;
         if updated {
@@ -1160,19 +1211,58 @@ impl BufferSearchBar {
             });
             self.set_search_options(options, cx);
             self.clear_matches(window, cx);
-            #[cfg(target_os = "macos")]
-            self.update_find_pasteboard(cx);
             cx.notify();
         }
         self.update_matches(!updated, add_to_history, window, cx)
     }
 
+    /// Defer updating the global until [`refresh_find_pasteboard`] so typing does not
+    /// rerun searches in every other deployed bar on each keystroke.
     #[cfg(target_os = "macos")]
-    pub fn update_find_pasteboard(&mut self, cx: &mut App) {
+    fn write_find_pasteboard(&mut self, cx: &mut App) {
         cx.write_to_find_pasteboard(gpui::ClipboardItem::new_string_with_metadata(
             self.query(cx),
             self.search_options.bits().to_string(),
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn publish_find_pasteboard(&mut self, cx: &mut App) {
+        self.write_find_pasteboard(cx);
+        let query = FindPasteboardQuery {
+            text: Some(self.query(cx)),
+            options: Some(self.search_options),
+        };
+        if cx.try_global::<FindPasteboardQuery>() != Some(&query) {
+            cx.set_global(query);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_find_pasteboard_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(global) = cx.try_global::<FindPasteboardQuery>() else {
+            return;
+        };
+        let Some(text) = global.text.clone() else {
+            return;
+        };
+        let options = global.options.unwrap_or(self.search_options);
+
+        if self.query(cx) == text {
+            return;
+        }
+        if self.query_editor_focused || self.replacement_editor_focused {
+            // Preserve the query while the user is editing it.
+            return;
+        }
+
+        if self.dismissed {
+            self.pending_external_query = Some((text, options));
+            return;
+        }
+        // Do not activate a match: syncing a background search bar must not scroll its
+        // editor or terminal.
+        drop(self.search_internal(&text, Some(options), true, window, cx));
     }
 
     pub fn use_selection_for_find(
@@ -1181,7 +1271,7 @@ impl BufferSearchBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.deploy(
+        let _deployed = self.deploy(
             &Deploy {
                 focus: false,
                 replace_enabled: false,
@@ -1191,6 +1281,13 @@ impl BufferSearchBar {
             window,
             cx,
         );
+
+        // `deploy` seeds the query synchronously. Republish even unchanged selections,
+        // since another application may have overwritten the find pasteboard.
+        #[cfg(target_os = "macos")]
+        if _deployed && !self.query(cx).is_empty() {
+            self.publish_find_pasteboard(cx);
+        }
     }
 
     pub fn focus_editor(&mut self, _: &FocusEditor, window: &mut Window, cx: &mut Context<Self>) {
@@ -1304,7 +1401,7 @@ impl BufferSearchBar {
     ) {
         #[cfg(target_os = "macos")]
         if let Some((query, options)) = self.pending_external_query.take() {
-            let search_rx = self.search(&query, Some(options), true, window, cx);
+            let search_rx = self.search_internal(&query, Some(options), true, window, cx);
             cx.spawn_in(window, async move |this, cx| {
                 if search_rx.await.is_ok() {
                     this.update_in(cx, |this, window, cx| {
@@ -1391,7 +1488,7 @@ impl BufferSearchBar {
                         this.update_in(cx, |this, window, cx| {
                             this.activate_current_match(window, cx);
                             #[cfg(target_os = "macos")]
-                            this.update_find_pasteboard(cx);
+                            this.write_find_pasteboard(cx);
                         })?;
                     }
                     anyhow::Ok(())
@@ -1509,8 +1606,6 @@ impl BufferSearchBar {
         let (done_tx, done_rx) = oneshot::channel();
         let query = self.query(cx);
         self.pending_search.take();
-        #[cfg(target_os = "macos")]
-        self.pending_external_query.take();
 
         if let Some(active_searchable_item) = self.active_searchable_item.as_ref() {
             self.query_error = None;
@@ -3465,6 +3560,293 @@ mod tests {
                 .display_ranges(&editor.display_snapshot(cx))),
             [DisplayPoint::new(DisplayRow(5), 0)..DisplayPoint::new(DisplayRow(5), 3)]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn init_find_pasteboard_test(
+        cx: &mut TestAppContext,
+    ) -> (
+        &'static mut VisualTestContext,
+        Entity<Editor>,
+        Entity<BufferSearchBar>,
+    ) {
+        init_globals(cx);
+        let app_state = cx.update(AppState::test);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let buffer = cx.new(|cx| {
+            Buffer::local(
+                r#"
+                dad
+                cat
+                mom
+                dog
+                dog
+                cat
+                dad
+                mom
+                "#
+                .unindent(),
+                cx,
+            )
+        });
+        let multibuffer = cx.update(|cx| MultiBuffer::build_from_buffer(buffer, cx));
+        let mut editor = None;
+        let mut search_bar = None;
+
+        let window = cx.add_window(|window, cx| {
+            let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-macos.json",
+                cx,
+            )
+            .unwrap();
+            cx.bind_keys(default_key_bindings);
+            let workspace = cx.new(|cx| Workspace::test_new(project.clone(), window, cx));
+            let multi_workspace = MultiWorkspace::new(workspace.clone(), window, cx);
+            let buffer_search_bar = cx.new(|cx| BufferSearchBar::new(None, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.toolbar().update(cx, |toolbar, cx| {
+                        toolbar.add_item(buffer_search_bar.clone(), window, cx);
+                    });
+                });
+            });
+            let editor_handle = cx.new(|cx| {
+                Editor::new(
+                    editor::EditorMode::full(),
+                    multibuffer.clone(),
+                    Some(project.clone()),
+                    window,
+                    cx,
+                )
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_center(Box::new(editor_handle.clone()), window, cx);
+            });
+            window.focus(&editor_handle.focus_handle(cx), cx);
+            search_bar = Some(buffer_search_bar);
+            editor = Some(editor_handle);
+            multi_workspace
+        });
+
+        let cx = VisualTestContext::from_window(*window, cx).into_mut();
+
+        // A distinct baseline makes unintended pasteboard writes observable.
+        write_find_pasteboard_externally(FIND_PASTEBOARD_BASELINE, cx);
+        cx.run_until_parked();
+
+        (cx, editor.unwrap(), search_bar.unwrap())
+    }
+
+    #[cfg(target_os = "macos")]
+    const FIND_PASTEBOARD_BASELINE: &str = "baseline";
+
+    #[cfg(target_os = "macos")]
+    fn deploy_unfocused(search_bar: &Entity<BufferSearchBar>, cx: &mut VisualTestContext) {
+        search_bar.update_in(cx, |search_bar, window, cx| {
+            search_bar.deploy(
+                &Deploy {
+                    focus: false,
+                    replace_enabled: false,
+                    selection_search_enabled: false,
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn find_pasteboard_text(cx: &mut VisualTestContext) -> Option<String> {
+        cx.read(|cx| cx.read_from_find_pasteboard().and_then(|item| item.text()))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_find_pasteboard_externally(text: &str, cx: &mut VisualTestContext) {
+        // Other applications do not include Zed's search options metadata.
+        let item = gpui::ClipboardItem::new_string(text.to_string());
+        cx.update(|_, cx| cx.write_to_find_pasteboard(item));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn use_selection_for_find_in_another_app(text: &str, cx: &mut VisualTestContext) {
+        cx.deactivate_window();
+        write_find_pasteboard_externally(text, cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn select_word_on_row(row: u32, editor: &Entity<Editor>, cx: &mut VisualTestContext) {
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections
+                    .select_display_ranges([DisplayPoint::new(DisplayRow(row), 1)
+                        ..DisplayPoint::new(DisplayRow(row), 1)]);
+            });
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_deploy_does_not_clobber_find_pasteboard(cx: &mut TestAppContext) {
+        let (cx, editor, search_bar) = init_find_pasteboard_test(cx).await;
+
+        select_word_on_row(3, &editor, cx);
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+
+        search_bar.read_with(cx, |search_bar, cx| {
+            assert_eq!(search_bar.query(cx), "dog");
+        });
+        assert_eq!(
+            find_pasteboard_text(cx).as_deref(),
+            Some(FIND_PASTEBOARD_BASELINE)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_use_selection_for_find_republishes_unchanged_query(cx: &mut TestAppContext) {
+        let (cx, editor, search_bar) = init_find_pasteboard_test(cx).await;
+
+        select_word_on_row(3, &editor, cx);
+        cx.simulate_keystrokes("cmd-e");
+        cx.run_until_parked();
+        assert_eq!(find_pasteboard_text(cx).as_deref(), Some("dog"));
+
+        write_find_pasteboard_externally("stolen", cx);
+
+        cx.simulate_keystrokes("cmd-e");
+        cx.run_until_parked();
+        search_bar.read_with(cx, |search_bar, cx| {
+            assert_eq!(search_bar.query(cx), "dog");
+        });
+        assert_eq!(find_pasteboard_text(cx).as_deref(), Some("dog"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_typing_query_publishes_to_find_pasteboard(cx: &mut TestAppContext) {
+        let (cx, _editor, search_bar) = init_find_pasteboard_test(cx).await;
+
+        search_bar.update_in(cx, |search_bar, window, cx| {
+            search_bar.deploy(&Deploy::find(), None, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("m o m");
+        cx.run_until_parked();
+
+        assert_eq!(find_pasteboard_text(cx).as_deref(), Some("mom"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_external_find_pasteboard_reaches_deployed_search_bar(cx: &mut TestAppContext) {
+        let (cx, editor, search_bar) = init_find_pasteboard_test(cx).await;
+
+        select_word_on_row(3, &editor, cx);
+        deploy_unfocused(&search_bar, cx);
+        search_bar.read_with(cx, |search_bar, cx| {
+            assert_eq!(search_bar.query(cx), "dog");
+        });
+
+        use_selection_for_find_in_another_app("cat", cx);
+
+        search_bar.read_with(cx, |search_bar, cx| {
+            assert_eq!(search_bar.query(cx), "cat");
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_use_selection_for_find_updates_other_deployed_search_bar(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, editor, search_bar) = init_find_pasteboard_test(cx).await;
+
+        let other_buffer = cx.new(|cx| Buffer::local("dog\ncat\n".to_string(), cx));
+        let other_editor = cx.new_window_entity(|window, cx| {
+            Editor::for_buffer(other_buffer.clone(), None, window, cx)
+        });
+        let other_search_bar = cx.new_window_entity(|window, cx| {
+            let mut other_search_bar = BufferSearchBar::new(None, window, cx);
+            other_search_bar.set_active_pane_item(Some(&other_editor), window, cx);
+            other_search_bar.show(window, cx);
+            other_search_bar
+        });
+        cx.run_until_parked();
+
+        let selections_before = other_editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .display_ranges(&editor.display_snapshot(cx))
+        });
+
+        select_word_on_row(1, &editor, cx);
+        cx.simulate_keystrokes("cmd-e");
+        cx.run_until_parked();
+
+        search_bar.read_with(cx, |search_bar, cx| {
+            assert_eq!(search_bar.query(cx), "cat");
+        });
+        other_search_bar.read_with(cx, |other_search_bar, cx| {
+            assert_eq!(other_search_bar.query(cx), "cat");
+        });
+        assert_eq!(
+            other_editor.update(cx, |editor, cx| editor
+                .selections
+                .display_ranges(&editor.display_snapshot(cx))),
+            selections_before,
+            "syncing the find string must not move the other item's selections"
+        );
+    }
+
+    // Terminal output invalidates matches and must not discard a pending external query.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_external_query_survives_matches_invalidated(cx: &mut TestAppContext) {
+        let (cx, editor, search_bar) = init_find_pasteboard_test(cx).await;
+
+        use_selection_for_find_in_another_app("cat", cx);
+
+        search_bar.read_with(cx, |search_bar, _| {
+            assert!(
+                search_bar.is_dismissed(),
+                "the search bar should still be hidden"
+            );
+            assert_eq!(
+                search_bar
+                    .pending_external_query
+                    .as_ref()
+                    .map(|(query, _)| query.as_str()),
+                Some("cat")
+            );
+        });
+
+        editor.update_in(cx, |_, _, cx| {
+            cx.emit(SearchEvent::MatchesInvalidated);
+        });
+        cx.run_until_parked();
+
+        search_bar.read_with(cx, |search_bar, _| {
+            assert!(
+                search_bar.pending_external_query.is_some(),
+                "invalidating matches must not discard the stashed external query"
+            );
+        });
+
+        // The test platform does not restore focus on activation. Refocus the editor so
+        // cmd-g has a Pane context to dispatch through.
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-g");
+        cx.run_until_parked();
+        search_bar.read_with(cx, |search_bar, cx| {
+            assert_eq!(search_bar.query(cx), "cat");
+        });
     }
 
     #[perf]
