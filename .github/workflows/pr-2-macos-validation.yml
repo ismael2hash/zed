@@ -1,0 +1,83 @@
+name: Validate PR 2 on macOS
+
+on:
+  push:
+    branches:
+      - pr-2-macos-validation-20260917
+
+permissions:
+  contents: read
+
+jobs:
+  search-tests:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "0"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "0"
+      CARGO_BUILD_JOBS: "3"
+      CARGO_TERM_COLOR: never
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: 753e5eefd081678e39492de2a6d266246423bfd6
+          persist-credentials: false
+
+      - name: Record native macOS environment
+        run: |
+          mkdir -p validation
+          {
+            git rev-parse HEAD
+            sw_vers
+            uname -m
+            xcodebuild -version
+            xcrun --find metal
+            cmake --version
+            df -h .
+          } | tee validation/environment.txt
+          test "$(git rev-parse HEAD)" = 753e5eefd081678e39492de2a6d266246423bfd6
+          test "$(uname -s)" = Darwin
+
+      - name: Install repository Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+
+      - name: Install WASI SDK
+        run: ./script/download-wasi-sdk
+
+      - name: Run search tests serially
+        run: |
+          ulimit -n 4096
+          cargo +1.98.1 test --locked -p search --lib -- --test-threads=1 2>&1 | tee validation/search-tests.log
+
+      - name: Repeat buffer search tests in parallel
+        run: |
+          ulimit -n 4096
+          cargo +1.98.1 test --locked -p search --lib buffer_search -- --test-threads=4 2>&1 | tee validation/buffer-search-parallel.log
+
+      - name: Verify all six macOS regressions ran
+        run: |
+          for test_name in \
+            test_deploy_does_not_clobber_find_pasteboard \
+            test_use_selection_for_find_republishes_unchanged_query \
+            test_typing_query_publishes_to_find_pasteboard \
+            test_external_find_pasteboard_reaches_deployed_search_bar \
+            test_use_selection_for_find_updates_other_deployed_search_bar \
+            test_external_query_survives_matches_invalidated
+          do
+            grep -E "test buffer_search::tests::${test_name} \\.\\.\\. ok$" validation/search-tests.log
+          done
+          git diff --exit-code
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr-2-macos-753e5ee
+          path: validation/
+          retention-days: 14
